@@ -1,0 +1,68 @@
+# fitness 一時中継（非公開側のActions停止中だけ動かす。10/1 09:30 JST に自分で消える）
+name: fitness relay
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch: {}
+concurrency:
+  group: fitness-relay
+  cancel-in-progress: false
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    steps:
+      - name: run
+        env:
+          T: ${{ secrets.FL_TOKEN }}
+          TZ: Asia/Tokyo
+        run: |
+          set -e
+          H="Authorization: token $T"
+          if [ "$(date -u +%s)" -ge "$(date -u -d '2026-10-01T00:30:00Z' +%s)" ]; then
+            SHA=$(curl -s -H "$H" https://api.github.com/repos/shiojima-test/shiojima-test/contents/.github/workflows/fitness-relay.yml | python3 -c "import json,sys;print(json.load(sys.stdin)['sha'])")
+            curl -s -o /dev/null -X DELETE -H "$H" https://api.github.com/repos/shiojima-test/shiojima-test/contents/.github/workflows/fitness-relay.yml -d "{\"message\":\"remove relay\",\"sha\":\"$SHA\"}"
+            curl -s -o /dev/null -X DELETE -H "$H" https://api.github.com/repos/shiojima-test/shiojima-test/actions/secrets/FL_TOKEN
+            echo "removed"; exit 0
+          fi
+          git clone -q "https://x-access-token:$T@github.com/shiojima-test/fitness-log.git" fl >/dev/null 2>&1
+          cd fl
+          git config user.name fitness-hae-bot; git config user.email fitness-hae-bot@users.noreply.github.com
+          LH=$(git log -1 --format=%ct -- inbox/hae)
+          LS=$(git log -1 --format=%ct -- sync-status.txt)
+          if [ "$LH" -gt "$LS" ]; then
+            UP=$(git log -1 --format=%B -- inbox/hae | grep -o 'uploaded=[^ ]*' | tail -1 | cut -d= -f2)
+            GH=$(git log -1 --format=%cd --date=format-local:'%m/%d %H:%M:%S' -- inbox/hae)
+            set +e
+            OUT=$(python3 tools/sync_apple_health.py --no-icloud --src inbox/hae --push 2>&1); RC=$?
+            set -e
+            if [ $RC -eq 0 ] && ! echo "$OUT" | grep -q '\[NG\]'; then RES="ok $(echo "$OUT" | grep -E '^(マスタ|日次サマリ)' | tr -s ' ' | paste -sd';' -)"; else RES="NG"; fi
+            git pull -q --rebase
+            printf '%s\n' "$(date +%Y-%m-%dT%H:%M:%S%z) [Drive経由・中継] HAE書き出し(ドライブ着)=${UP:-不明} / GitHub着=${GH} / 取り込み=$(date +'%m/%d %H:%M:%S') / ${RES}" > /tmp/line
+            { head -1 sync-status.txt; cat /tmp/line; tail -n +2 sync-status.txt | head -40; } > /tmp/ss && mv /tmp/ss sync-status.txt
+            git add sync-status.txt; git commit -q -m "sync-status(Drive・中継): ${RES:0:80}"
+            git push -q origin HEAD:main || { git pull -q --rebase && git push -q origin HEAD:main; }
+            echo "ingest $RES" | cut -c1-12
+          fi
+          python3 tools/build_index.py >/dev/null 2>&1 || true
+          if ! git diff --quiet -- INDEX.md; then
+            git config user.name fitness-index-bot; git add INDEX.md; git commit -q -m "index: 自動再生成（中継）"
+            git push -q origin HEAD:main || { git pull -q --rebase && git push -q origin HEAD:main; }
+            echo "index updated"
+          fi
+          HEAD=$(git rev-parse --short=8 HEAD)
+          cd ..
+          git clone -q --depth 1 "https://x-access-token:$T@github.com/shiojima-test/fitness-viewer.git" viewer >/dev/null 2>&1
+          for f in events.md insights.md core.md references.md; do cp "fl/$f" "viewer/data/$f"; done
+          for f in log review; do
+            old=$(grep -o '^## ▼ [0-9][0-9]/[0-9][0-9]' "viewer/data/$f.md" | sort -u | wc -l || true)
+            { cat "fl/$f.md"; ls -1 fl/archive/$f-*.md 2>/dev/null | sort -r | xargs -r cat; } > "viewer/data/$f.md.new"
+            new=$(grep -o '^## ▼ [0-9][0-9]/[0-9][0-9]' "viewer/data/$f.md.new" | sort -u | wc -l || true)
+            if [ "$new" -ge "$old" ]; then mv "viewer/data/$f.md.new" "viewer/data/$f.md"; else rm "viewer/data/$f.md.new"; echo "skip $f"; fi
+          done
+          cd viewer
+          if git diff --quiet -- data; then echo "viewer unchanged"; exit 0; fi
+          date -u +"%Y-%m-%dT%H:%M:%SZ (from $HEAD relay)" > data/.last-sync
+          git config user.name fitness-sync-bot; git config user.email actions@users.noreply.github.com
+          git add data; git commit -q -m "sync: fitness-log $HEAD（中継）"; git push -q
+          curl -s -o /dev/null -X POST -H "$H" https://api.github.com/repos/shiojima-test/fitness-viewer/pages/builds
+          echo "viewer synced"
