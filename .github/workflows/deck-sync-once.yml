@@ -1,0 +1,17 @@
+name: deck-sync-once
+on:
+  workflow_dispatch:
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: sync
+        env:
+          U: ${{ secrets.DECK_HOOK_URL }}
+        run: |
+          python3 - <<'PY'
+          import json,os,urllib.request
+          r=urllib.request.Request(os.environ["U"],data=json.dumps({"action":"task","id":"deck_sync"}).encode(),headers={"Content-Type":"application/json"})
+          d=json.loads(urllib.request.urlopen(r,timeout=360).read().decode())
+          print("ok",d.get("ok"))
+          PY
